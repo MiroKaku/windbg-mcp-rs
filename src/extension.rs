@@ -46,6 +46,7 @@ pub unsafe extern "system" fn DebugExtensionInitialize(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DebugExtensionUninitialize() {
+    let _ = notify_windbg("WinDbg MCP server is stopping...\n");
     let _ = PluginServerControl::stop();
     clear_primary_client();
 }
