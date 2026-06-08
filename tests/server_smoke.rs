@@ -10,7 +10,8 @@ async fn mock_dispatcher_returns_scripted_output() {
         "ntdll!_PEB_LDR_DATA".to_string(),
     );
 
-    let (dispatcher, _handle) = CommandDispatcher::spawn(ExecutionMode::Mock { responses }).expect("mock dispatcher should start");
+    let dispatcher = CommandDispatcher::spawn(ExecutionMode::Mock { responses })
+        .expect("mock dispatcher should start");
 
     let output = dispatcher
         .execute("dt _PEB_LDR_DATA")
@@ -22,9 +23,10 @@ async fn mock_dispatcher_returns_scripted_output() {
 
 #[tokio::test]
 async fn mock_dispatcher_reports_state_and_interrupts() {
-    let (dispatcher, _handle) = CommandDispatcher::spawn(ExecutionMode::Mock {
+    let dispatcher = CommandDispatcher::spawn(ExecutionMode::Mock {
         responses: HashMap::new(),
-    }).expect("mock dispatcher should start");
+    })
+    .expect("mock dispatcher should start");
 
     let state = dispatcher
         .query_state()

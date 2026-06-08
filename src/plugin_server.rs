@@ -24,7 +24,7 @@ const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:50051";
 
 static SERVER_STATE: LazyLock<Mutex<Option<RunningPluginServer>>> =
     LazyLock::new(|| Mutex::new(None));
-static DISPATCHER_STATE: LazyLock<Mutex<Option<(CommandDispatcher, JoinHandle<()>)>>> =
+static DISPATCHER_STATE: LazyLock<Mutex<Option<CommandDispatcher>>> =
     LazyLock::new(|| Mutex::new(None));
 
 #[derive(Debug, Clone)]
@@ -42,25 +42,27 @@ pub struct PluginServerControl;
 
 impl PluginServerControl {
     pub fn get_or_start_dispatcher() -> Result<CommandDispatcher, String> {
-        {
+        let existing = {
             let state = DISPATCHER_STATE
                 .lock()
                 .map_err(|_| "dispatcher state lock poisoned".to_string())?;
-            if let Some((dispatcher, _)) = state.as_ref() {
-                return Ok(dispatcher.clone());
-            }
+            state.clone()
+        };
+
+        if let Some(dispatcher) = existing {
+            return Ok(dispatcher);
         }
 
         match CommandDispatcher::spawn(ExecutionMode::CurrentSession) {
-            Ok((dispatcher, join_handle)) => {
+            Ok(dispatcher) => {
                 let mut state = DISPATCHER_STATE
                     .lock()
                     .map_err(|_| "dispatcher state lock poisoned".to_string())?;
-                if let Some((existing, _)) = state.as_ref() {
+                if let Some(existing) = state.as_ref() {
                     return Ok(existing.clone());
                 }
                 let cloned = dispatcher.clone();
-                *state = Some((dispatcher, join_handle));
+                *state = Some(dispatcher);
                 let _ = notify_windbg("WinDbg MCP debugger session connected.\n");
                 Ok(cloned)
             }
@@ -88,26 +90,48 @@ impl PluginServerControl {
             return Ok(existing.status.clone());
         }
 
-        let running = spawn_server_thread(BindTarget::Exact(bind_address), false)?;
-        let status = running.status.clone();
-        *state = Some(running);
-        Ok(status)
-    }
+        let cancellation = CancellationToken::new();
+        let cancellation_for_thread = cancellation.clone();
+        let (startup_tx, startup_rx) = mpsc::channel::<Result<PluginServerStatus, String>>();
+        let thread_bind = bind_address.clone();
 
-    pub fn auto_start() -> Result<PluginServerStatus, String> {
-        let mut state = SERVER_STATE
-            .lock()
-            .map_err(|_| "server state lock poisoned".to_string())?;
-        if let Some(existing) = state.as_ref() {
-            return Ok(existing.status.clone());
-        }
+        let join_handle = thread::Builder::new()
+            .name("windbg-mcp-plugin-server".to_string())
+            .spawn(move || {
+                let startup_error_tx = startup_tx.clone();
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = startup_tx.send(Err(error.to_string()));
+                        return;
+                    }
+                };
 
-        let running = spawn_server_thread(
-            BindTarget::Exact(DEFAULT_BIND_ADDRESS.to_string()),
-            true,
-        )?;
-        let status = running.status.clone();
-        *state = Some(running);
+                let result = runtime.block_on(async move {
+                    run_server_loop(thread_bind, cancellation_for_thread, startup_tx).await
+                });
+
+                if let Err(error) = result {
+                    let _ = startup_error_tx.send(Err(error.clone()));
+                    tracing::error!("plugin MCP server stopped with error: {error}");
+                }
+            })
+            .map_err(|error| error.to_string())?;
+
+        let status = startup_rx
+            .recv()
+            .map_err(|_| "plugin server failed to report startup status".to_string())??;
+
+        *state = Some(RunningPluginServer {
+            status: status.clone(),
+            cancellation,
+            join_handle,
+        });
+
         Ok(status)
     }
 
@@ -119,16 +143,6 @@ impl PluginServerControl {
     }
 
     pub fn stop() -> Result<Option<PluginServerStatus>, String> {
-
-        // 1. Drop dispatcher sender and join its thread.
-        let dispatcher_join = {
-            let mut dispatcher_state = DISPATCHER_STATE
-                .lock()
-                .map_err(|_| "dispatcher state lock poisoned".to_string())?;
-            dispatcher_state.take().map(|(_dispatcher, handle)| handle)
-        };
-
-        // 2. Cancel and join the server thread.
         let running = {
             let mut state = SERVER_STATE
                 .lock()
@@ -136,10 +150,11 @@ impl PluginServerControl {
             state.take()
         };
 
+        if let Ok(mut dispatcher_state) = DISPATCHER_STATE.lock() {
+            dispatcher_state.take();
+        }
+
         let Some(running) = running else {
-            if let Some(handle) = dispatcher_join {
-                let _ = handle.join();
-            }
             return Ok(None);
         };
 
@@ -148,109 +163,26 @@ impl PluginServerControl {
             .join_handle
             .join()
             .map_err(|_| "plugin server thread panicked".to_string())?;
-
-        if let Some(handle) = dispatcher_join {
-            let _ = handle.join();
-        }
-
         Ok(Some(running.status))
     }
 }
 
-enum BindTarget {
-    Exact(String),
-}
-
-fn spawn_server_thread(
-    target: BindTarget,
-    fallback_on_busy: bool,
-) -> Result<RunningPluginServer, String> {
-    let cancellation = CancellationToken::new();
-    let cancellation_for_thread = cancellation.clone();
-    let (startup_tx, startup_rx) = mpsc::channel::<Result<PluginServerStatus, String>>();
-
-    let initial_addr = match &target {
-        BindTarget::Exact(addr) => addr.clone(),
-    };
-
-
-    let join_handle = thread::Builder::new()
-        .name("windbg-mcp-plugin-server".to_string())
-        .spawn(move || {
-            let startup_error_tx = startup_tx.clone();
-
-            let runtime = match tokio::runtime::Builder::new_multi_thread()
-                .enable_io()
-                .enable_time()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let _ = startup_tx.send(Err(error.to_string()));
-                    return;
-                }
-            };
-
-            let result = runtime.block_on(async move {
-                let listener = match TcpListener::bind(&initial_addr).await {
-                    Ok(l) => {
-                        l
-                    }
-                    Err(e) if fallback_on_busy && is_addr_in_use(&e.to_string()) => {
-                        TcpListener::bind("127.0.0.1:0")
-                            .await
-                            .map_err(|e2| {
-                                e2.to_string()
-                            })?
-                    }
-                    Err(e) => {
-                        return Err(e.to_string());
-                    }
-                };
-
-                let local_addr = listener.local_addr().map_err(|e| e.to_string())?;
-                let status = PluginServerStatus {
-                    mcp_url: format!("http://{}:{}/mcp", local_addr.ip(), local_addr.port()),
-                };
-
-                if startup_tx.send(Ok(status)).is_err() {
-                    return Err("plugin server startup receiver dropped".to_string());
-                }
-
-                let serve_result = run_server_loop(listener, cancellation_for_thread).await;
-                serve_result
-            });
-
-            if let Err(error) = &result {
-                let _ = startup_error_tx.send(Err(error.clone()));
-            } else {
-            }
-        })
-        .map_err(|error| error.to_string())?;
-
-    let status = startup_rx
-        .recv()
-        .map_err(|_| "plugin server failed to report startup status".to_string())??;
-
-    Ok(RunningPluginServer {
-        status,
-        cancellation,
-        join_handle,
-    })
-}
-
-fn is_addr_in_use(error: &str) -> bool {
-    let lower = error.to_lowercase();
-    lower.contains("address already in use")
-        || lower.contains("address in use")
-        || lower.contains("eaddrinuse")
-        || lower.contains("10048")
-}
-
 async fn run_server_loop(
-    listener: TcpListener,
+    bind_address: String,
     cancellation: CancellationToken,
+    startup_tx: mpsc::Sender<Result<PluginServerStatus, String>>,
 ) -> Result<(), String> {
+    let listener = TcpListener::bind(&bind_address)
+        .await
+        .map_err(|error| error.to_string())?;
+    let local_addr = listener.local_addr().map_err(|error| error.to_string())?;
+    let status = PluginServerStatus {
+        mcp_url: format!("http://{}:{}/mcp", local_addr.ip(), local_addr.port()),
+    };
+    startup_tx
+        .send(Ok(status))
+        .map_err(|_| "plugin server startup receiver dropped".to_string())?;
+
     let service: StreamableHttpService<WindbgMcpServer> = StreamableHttpService::new(
         || Ok(WindbgMcpServer::new()),
         Default::default(),

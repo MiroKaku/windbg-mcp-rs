@@ -1,7 +1,6 @@
 use std::ffi::CString;
 
 use windows::{
-    core::{HRESULT, Interface, PCSTR, Ref, Result as WinResult},
     Win32::{
         Foundation::{E_FAIL, E_POINTER, S_OK},
         System::Diagnostics::Debug::Extensions::{
@@ -9,6 +8,7 @@ use windows::{
             DEBUG_OUTPUT_NORMAL, IDebugClient, IDebugControl,
         },
     },
+    core::{HRESULT, Interface, PCSTR, Ref, Result as WinResult},
 };
 
 use crate::plugin_server::notify_windbg;
@@ -20,8 +20,6 @@ use crate::{
 
 const EXTENSION_MAJOR: u32 = 0;
 const EXTENSION_MINOR: u32 = 1;
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DebugExtensionInitialize(
@@ -48,14 +46,13 @@ pub unsafe extern "system" fn DebugExtensionInitialize(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DebugExtensionUninitialize() {
-    let _ = PluginServerControl::stop();
     clear_primary_client();
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DebugExtensionNotify(notify: u32, _argument: u64) {
     match notify {
-        DEBUG_NOTIFY_SESSION_ACTIVE => match PluginServerControl::auto_start() {
+        DEBUG_NOTIFY_SESSION_ACTIVE => match PluginServerControl::start(None) {
             Ok(status) => {
                 let _ = notify_windbg(&format!(
                     "WinDbg MCP server is running at {}\n",
