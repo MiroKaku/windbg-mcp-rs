@@ -76,7 +76,7 @@ impl WindbgMcpServer {
     fn generic_command_tool(&self) -> Tool {
         Tool::new(
             "windbg_execute_command",
-            "Execute a non-resuming WinDbg command string through dbgeng. The debugger must already be ready for commands; query state first and interrupt explicitly when needed. Execution-control commands such as g/p/t are blocked.",
+            "Execute a WinDbg command string through dbgeng. The debugger must already be ready for commands; query state first and interrupt explicitly when needed.",
             schema_for_type::<ExecuteRawArgs>(),
         )
         .with_title("Execute WinDbg command")

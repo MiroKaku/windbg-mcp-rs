@@ -36,8 +36,6 @@ pub enum ExecutionError {
     Startup(String),
     #[error("command execution failed: {0}")]
     Command(String),
-    #[error("execution-control command `{0}` is blocked; use explicit interrupt/state flow or run it directly in WinDbg")]
-    UnsafeExecutionControl(String),
     #[error("string contains an embedded NUL byte")]
     InvalidCString,
     #[error("this execution mode is only available on Windows")]
@@ -384,36 +382,6 @@ fn build_executor(mode: ExecutionMode) -> Result<Box<dyn BlockingExecutor>, Exec
     }
 }
 
-fn blocked_execution_control(command: &str) -> Option<&str> {
-    let first = command
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .trim_start_matches('.')
-        .trim();
-
-    if first.is_empty() {
-        return None;
-    }
-
-    const BLOCKED: &[&str] = &[
-        "g",
-        "gh",
-        "gn",
-        "gu",
-        "p",
-        "pa",
-        "pc",
-        "pt",
-        "t",
-    ];
-
-    BLOCKED
-        .iter()
-        .copied()
-        .find(|token| first.eq_ignore_ascii_case(token))
-}
-
 struct MockExecutor {
     responses: HashMap<String, String>,
     state: DebuggerExecutionState,
@@ -425,9 +393,6 @@ struct MockExecutor {
         }
 
         fn execute_ready(&mut self, command: &str) -> Result<String, ExecutionError> {
-            if let Some(blocked) = blocked_execution_control(command) {
-                return Err(ExecutionError::UnsafeExecutionControl(blocked.to_string()));
-            }
             Ok(self
                 .responses
                 .get(command)
@@ -456,7 +421,7 @@ mod windows_impl {
 
     use crate::primary_client::create_client_from_primary;
 
-    use super::{BlockingExecutor, CString, DebuggerExecutionState, ExecutionError, blocked_execution_control};
+    use super::{BlockingExecutor, CString, DebuggerExecutionState, ExecutionError};
 
     #[implement(IDebugOutputCallbacks)]
     struct OutputCollector {
@@ -516,9 +481,6 @@ mod windows_impl {
         }
 
         fn execute_ready(&mut self, command: &str) -> Result<String, ExecutionError> {
-            if let Some(blocked) = blocked_execution_control(command) {
-                return Err(ExecutionError::UnsafeExecutionControl(blocked.to_string()));
-            }
             let captured = Arc::new(Mutex::new(String::new()));
             let callback: IDebugOutputCallbacks = OutputCollector::new(captured.clone()).into();
             let child = unsafe { self.client.CreateClient() }
@@ -611,22 +573,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn blocked_execution_control_detects_resume_commands() {
-        assert_eq!(blocked_execution_control("g"), Some("g"));
-        assert_eq!(blocked_execution_control("gu"), Some("gu"));
-        assert_eq!(blocked_execution_control(".gh"), Some("gh"));
-        assert_eq!(blocked_execution_control("dt nt!_EPROCESS"), None);
-    }
-
-    #[test]
-    fn mock_executor_rejects_execution_control_commands() {
-        let mut executor = MockExecutor {
-            responses: HashMap::new(),
-            state: DebuggerExecutionState::break_state(),
-        };
-
-        let error = executor.execute("g").expect_err("g must be blocked");
-        assert!(matches!(error, ExecutionError::UnsafeExecutionControl(_)));
-    }
 }
