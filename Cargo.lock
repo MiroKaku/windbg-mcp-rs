@@ -1151,7 +1151,7 @@ dependencies = [
 
 [[package]]
 name = "windbg-mcp-rs"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "axum",
  "rmcp",
