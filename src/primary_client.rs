@@ -1,13 +1,13 @@
 use std::sync::{LazyLock, Mutex};
 
-use windows::{
-    Win32::System::Diagnostics::Debug::Extensions::{DebugCreate, IDebugClient},
-};
+use windows::Win32::System::Diagnostics::Debug::Extensions::{DebugCreate, IDebugClient};
 
 struct SharedPrimaryClient(IDebugClient);
 
-// DbgEng documents CreateClient as callable from any thread. We only keep the
-// primary client to derive thread-local clients through that method.
+// SAFETY: The primary IDebugClient is only used to derive new thread-local
+// clients through IDebugClient::CreateClient, which DbgEng documents as safe to
+// call from any thread. We never mutate the interface pointer from multiple
+// threads.
 unsafe impl Send for SharedPrimaryClient {}
 unsafe impl Sync for SharedPrimaryClient {}
 

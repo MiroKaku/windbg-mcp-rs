@@ -5,10 +5,11 @@ use rmcp::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+#[cfg(windows)]
+use crate::plugin_server::PluginServerControl;
 use crate::{
     catalog::{Catalog, CatalogEntry, CatalogResourceKind, CatalogSection},
     executor::CommandDispatcher,
-    plugin_server::PluginServerControl,
     resources::{GUIDE_URI, render_compact_command, render_full_command, render_guide},
 };
 
@@ -40,9 +41,7 @@ pub struct WindbgMcpServer {
 
 impl WindbgMcpServer {
     pub fn new() -> Self {
-        Self {
-            dispatcher_override: None,
-        }
+        Self::default()
     }
 
     #[cfg(test)]
@@ -61,8 +60,18 @@ impl WindbgMcpServer {
             return Ok(dispatcher.clone());
         }
 
-        PluginServerControl::get_or_start_dispatcher()
-            .map_err(|error| McpError::internal_error(error, None))
+        #[cfg(windows)]
+        {
+            PluginServerControl::get_or_start_dispatcher()
+                .map_err(|error| McpError::internal_error(error, None))
+        }
+        #[cfg(not(windows))]
+        {
+            Err(McpError::internal_error(
+                "WinDbg plugin dispatcher is only available on Windows".to_string(),
+                None,
+            ))
+        }
     }
 
     fn parse_arguments<T>(&self, arguments: Option<JsonObject>) -> Result<T, McpError>
@@ -121,10 +130,11 @@ impl WindbgMcpServer {
             .find(|line| !line.trim().is_empty())
             .unwrap_or(syntax);
         let preview = preview.trim();
-        if preview.len() <= 160 {
+        if preview.chars().count() <= 160 {
             Some(preview.to_string())
         } else {
-            Some(format!("{}...", &preview[..157]))
+            let truncated: String = preview.chars().take(157).collect();
+            Some(format!("{truncated}..."))
         }
     }
 

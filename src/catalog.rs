@@ -127,6 +127,10 @@ impl Catalog {
         self.entries.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn command_template_uri(&self) -> &'static str {
         TEMPLATE_URI
     }
@@ -367,7 +371,7 @@ fn is_syntax_section_boundary(line: &str) -> bool {
 fn search_terms(query: &str) -> Vec<String> {
     query
         .split_whitespace()
-        .filter_map(|term| normalize_search_term(term))
+        .filter_map(normalize_search_term)
         .collect()
 }
 

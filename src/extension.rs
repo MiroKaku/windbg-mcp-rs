@@ -21,6 +21,8 @@ use crate::{
 const EXTENSION_MAJOR: u32 = 0;
 const EXTENSION_MINOR: u32 = 1;
 
+/// # Safety
+/// Called by dbgeng with valid, non-null pointers to `version` and `flags`.
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DebugExtensionInitialize(
     version: *mut u32,
@@ -44,6 +46,8 @@ pub unsafe extern "system" fn DebugExtensionInitialize(
     S_OK
 }
 
+/// # Safety
+/// Called by dbgeng during extension unload. No parameters are passed.
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DebugExtensionUninitialize() {
     let _ = notify_windbg("WinDbg MCP server is stopping...\n");
@@ -51,6 +55,9 @@ pub unsafe extern "system" fn DebugExtensionUninitialize() {
     clear_primary_client();
 }
 
+/// # Safety
+/// Called by dbgeng with a session notification code. `_argument` is unused and
+/// ignored as documented by the extension callback contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DebugExtensionNotify(notify: u32, _argument: u64) {
     match notify {
@@ -73,6 +80,9 @@ pub unsafe extern "system" fn DebugExtensionNotify(notify: u32, _argument: u64) 
     }
 }
 
+/// # Safety
+/// Called by dbgeng with a valid `IDebugClient` reference and an optional
+/// null-terminated command string.
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn mcp(client: Ref<IDebugClient>, args: PCSTR) -> HRESULT {
     match run_mcp_command(client, args) {

@@ -387,15 +387,15 @@ struct MockExecutor {
     state: DebuggerExecutionState,
 }
 
-    impl BlockingExecutor for MockExecutor {
-        fn query_state(&mut self) -> Result<DebuggerExecutionState, ExecutionError> {
-            Ok(self.state.clone())
-        }
+impl BlockingExecutor for MockExecutor {
+    fn query_state(&mut self) -> Result<DebuggerExecutionState, ExecutionError> {
+        Ok(self.state.clone())
+    }
 
-        fn execute_ready(&mut self, command: &str) -> Result<String, ExecutionError> {
-            Ok(self
-                .responses
-                .get(command)
+    fn execute_ready(&mut self, command: &str) -> Result<String, ExecutionError> {
+        Ok(self
+            .responses
+            .get(command)
             .cloned()
             .unwrap_or_else(|| format!("mock-executed: {command}")))
     }
@@ -472,7 +472,6 @@ mod windows_impl {
                 .cast::<IDebugControl>()
                 .map_err(|error| ExecutionError::Command(error.to_string()))
         }
-
     }
 
     impl BlockingExecutor for DbgEngExecutor {
@@ -572,5 +571,4 @@ mod tests {
                 .contains("debugger is not ready for commands")
         );
     }
-
 }
