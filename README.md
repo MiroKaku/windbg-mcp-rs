@@ -15,7 +15,18 @@
 
 ## Quick Start
 
-### 1. Build the DLL
+### 1. Install the released extension
+
+**One-liner (recommended):**
+
+```powershell
+irm https://raw.githubusercontent.com/kanren3/windbg-mcp-rs/master/scripts/install.ps1 | iex
+```
+
+This downloads the latest release from GitHub and installs to all discovered WinDbg locations.  
+Run as **Administrator** to install to SDK debugger paths.
+
+### 2. Build the DLL (developers)
 
 ```powershell
 # x64 (default)
@@ -40,18 +51,9 @@ Release tags publish one architecture-specific archive for every supported WinDb
 
 The checked-in gallery manifest remains architecture-neutral (`Architecture="Any"`). The installer generates Store-only absolute entries for the architectures actually installed.
 
-### 2. Install the extension
+### 3. Install a local build
 
-**One-liner (recommended):**
-
-```powershell
-irm https://raw.githubusercontent.com/kanren3/windbg-mcp-rs/master/scripts/install.ps1 | iex
-```
-
-This downloads the latest release from GitHub and installs to all discovered WinDbg locations.  
-Run as **Administrator** to install to SDK debugger paths.
-
-**From local build (developers):**
+**Install from local build:**
 
 ```powershell
 .\scripts\install.ps1 -LocalPath .\target
@@ -79,7 +81,7 @@ copy windbg_mcp_rs_GalleryManifest.xml                 <windbg>\OptionalExtensio
 #   .settings save
 ```
 
-### 3. Verify
+### 4. Verify
 
 Start WinDbg and run:
 
@@ -90,7 +92,7 @@ Start WinDbg and run:
 The MCP server **auto-starts** when WinDbg reports an active debugging session.  
 Endpoint: the first available endpoint from `http://127.0.0.1:50051/mcp` through `http://127.0.0.1:50070/mcp`.
 
-### 4. Connect your MCP client
+### 5. Connect your MCP client
 
 Run `!mcp status` and point your client to the reported endpoint. For a single instance this is usually:
 
