@@ -21,10 +21,24 @@
 # x64 (default)
 cargo build --release --target x86_64-pc-windows-msvc
 
+# x86 / 32-bit WinDbg
+rustup target add i686-pc-windows-msvc
+cargo build --release --target i686-pc-windows-msvc
+
 # ARM64
 rustup target add aarch64-pc-windows-msvc
 cargo build --release --target aarch64-pc-windows-msvc
 ```
+
+Release tags publish one architecture-specific archive for every supported WinDbg engine:
+
+| WinDbg architecture | Rust target | Release suffix | Store DLL destination |
+| --- | --- | --- | --- |
+| x86 | `i686-pc-windows-msvc` | `windows-x86.zip` | `EngineExtensions32\windbg_mcp_rs_x86.dll` |
+| x64 | `x86_64-pc-windows-msvc` | `windows-x64.zip` | `EngineExtensions\windbg_mcp_rs_x64.dll` |
+| ARM64 | `aarch64-pc-windows-msvc` | `windows-arm64.zip` | `EngineExtensions\windbg_mcp_rs_arm64.dll` |
+
+The checked-in gallery manifest remains architecture-neutral (`Architecture="Any"`). The installer generates Store-only absolute entries for the architectures actually installed.
 
 ### 2. Install the extension
 
@@ -43,20 +57,26 @@ Run as **Administrator** to install to SDK debugger paths.
 .\scripts\install.ps1 -LocalPath .\target
 ```
 
+`-LocalPath` accepts either a flat directory containing `windbg_mcp_rs.dll` or a build root containing `<RustTarget>\release\windbg_mcp_rs.dll`. The installer reads each DLL's PE machine, rejects mismatched or duplicate candidates, discovers Store packages through `Get-AppxPackage` before falling back to `WindowsApps`, and returns a nonzero exit code if any required architecture fails. Validate without changing installation files with:
+
+```powershell
+.\scripts\install.ps1 -LocalPath .\target -DryRun
+```
+
 **Manual install:**
 
 ```text
 # SDK Debuggers
-copy target\release\windbg_mcp_rs.dll                  <windbg>\winext\
+copy target\<RustTarget>\release\windbg_mcp_rs.dll     <matching-windbg>\winext\
 copy windbg_mcp_rs_GalleryManifest.xml                 <windbg>\OptionalExtensions\
 
 # WinDbg (Store) — use install.ps1 (manual setup is complex)
-# The script handles config.xml, GUID, and manifest path rewriting automatically.
-# If you must do it manually:
-#   DLL  → %LOCALAPPDATA%\DBG\EngineExtensions\
-#   Gallery files → %LOCALAPPDATA%\DBG\ExtRepository\windbg-mcp-rs\
-#   Then: .settings load %LOCALAPPDATA%\DBG\ExtRepository\windbg-mcp-rs\config.xml
-#   Then: .settings save
+# The script uses distinct x86/x64/ARM64 DLL names, rewrites the manifest with
+# absolute architecture-specific paths, and publishes the shared gallery files
+# atomically under %LOCALAPPDATA%\DBG\ExtRepository\windbg-mcp-rs\.
+# Then run:
+#   .settings load %LOCALAPPDATA%\DBG\ExtRepository\windbg-mcp-rs\config.xml
+#   .settings save
 ```
 
 ### 3. Verify
@@ -68,15 +88,25 @@ Start WinDbg and run:
 ```
 
 The MCP server **auto-starts** when WinDbg reports an active debugging session.  
-Endpoint: `http://127.0.0.1:50051/mcp`
+Endpoint: the first available endpoint from `http://127.0.0.1:50051/mcp` through `http://127.0.0.1:50070/mcp`.
 
 ### 4. Connect your MCP client
 
-Point your client to:
+Run `!mcp status` and point your client to the reported endpoint. For a single instance this is usually:
 
 ```text
 http://127.0.0.1:50051/mcp
 ```
+
+## Multi-Instance Discovery
+
+When the default port is already in use, auto-start tries the next localhost port up to `127.0.0.1:50070`. Each running WinDbg instance writes a user-local discovery file:
+
+```text
+%LOCALAPPDATA%\Dbg\windbg-mcp-rs\instances\instance-<pid>.json
+```
+
+The JSON file contains the MCP server name and URL, host WinDbg/EngHost process id, host architecture, host process path, start timestamp, and a best-effort `current_target` snapshot for discovery prioritization. In schema 1, `mcp_server_name` and `mcp_server_url` identify the MCP endpoint, `host_pid`, `host_arch`, and `host_process_path` identify the process hosting the MCP extension, while `current_target` uses `name` for the active target image name/path, `source_path` for offline dump/trace source files when available, and `transport`/`endpoint` for remote transports. `current_target` can be `null` during early startup or after the debug session becomes inactive, and is refreshed after WinDbg reports an accessible session or a relevant target/session event. The snapshot is only a hint; clients must still treat registry files as candidates and confirm liveness and target identity with an MCP `initialize` handshake before using the endpoint. The running extension keeps its own JSON file open with read sharing enabled and delete sharing disabled. When another instance starts, it tries to delete old `instance-*.json` files; active instances remain locked, while stale files from crashed or killed WinDbg processes are normally removed.
 
 ## WinDbg Commands
 

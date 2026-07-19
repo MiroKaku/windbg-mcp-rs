@@ -6,6 +6,10 @@ pub mod plugin_server;
 pub mod primary_client;
 pub mod resources;
 pub mod server;
+#[cfg(windows)]
+pub mod target_events;
+#[cfg(windows)]
+pub mod target_snapshot;
 
 #[cfg(windows)]
 pub mod extension;

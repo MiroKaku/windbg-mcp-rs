@@ -4,18 +4,20 @@ use windows::{
     Win32::{
         Foundation::{E_FAIL, E_POINTER, S_OK},
         System::Diagnostics::Debug::Extensions::{
-            DEBUG_NOTIFY_SESSION_ACTIVE, DEBUG_NOTIFY_SESSION_INACTIVE, DEBUG_OUTPUT_ERROR,
+            DEBUG_NOTIFY_SESSION_ACCESSIBLE, DEBUG_NOTIFY_SESSION_ACTIVE,
+            DEBUG_NOTIFY_SESSION_INACCESSIBLE, DEBUG_NOTIFY_SESSION_INACTIVE, DEBUG_OUTPUT_ERROR,
             DEBUG_OUTPUT_NORMAL, IDebugClient, IDebugControl,
         },
     },
     core::{HRESULT, Interface, PCSTR, Ref, Result as WinResult},
 };
 
-use crate::plugin_server::notify_windbg;
+use crate::plugin_server::{PluginServerStatus, SessionEvent, notify_windbg};
 use crate::{
     Catalog,
     plugin_server::PluginServerControl,
     primary_client::{clear_primary_client, initialize_primary_client},
+    target_events::{clear_target_event_callbacks, ensure_target_event_callbacks},
 };
 
 const EXTENSION_MAJOR: u32 = 0;
@@ -50,8 +52,16 @@ pub unsafe extern "system" fn DebugExtensionInitialize(
 /// Called by dbgeng during extension unload. No parameters are passed.
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DebugExtensionUninitialize() {
-    let _ = notify_windbg("WinDbg MCP server is stopping...\n");
-    let _ = PluginServerControl::stop();
+    if let Err(error) = clear_target_event_callbacks() {
+        let _ = notify_windbg(&format!(
+            "WinDbg MCP event callback unregistration failed: {error}\n"
+        ));
+    }
+    if let Err(error) = PluginServerControl::stop_for_unload() {
+        let _ = notify_windbg(&format!(
+            "WinDbg MCP server unload cleanup failed: {error}\n"
+        ));
+    }
     clear_primary_client();
 }
 
@@ -63,18 +73,54 @@ pub unsafe extern "system" fn DebugExtensionNotify(notify: u32, _argument: u64) 
     match notify {
         DEBUG_NOTIFY_SESSION_ACTIVE => match PluginServerControl::start(None) {
             Ok(status) => {
-                let _ = notify_windbg(&format!(
-                    "WinDbg MCP server is running at {}\n",
-                    status.mcp_url
-                ));
+                if let Err(error) = ensure_target_event_callbacks() {
+                    let _ = notify_windbg(&format!(
+                        "WinDbg MCP event callback registration failed: {error}\n"
+                    ));
+                }
+                if let Err(error) = PluginServerControl::apply_session_event(SessionEvent::Active) {
+                    let _ = notify_windbg(&format!(
+                        "WinDbg MCP active session transition failed: {error}\n"
+                    ));
+                }
+                let _ = notify_windbg(&format_status(&status));
             }
             Err(error) => {
                 let _ = notify_windbg(&format!("WinDbg MCP server auto-start failed: {error}\n"));
             }
         },
+        DEBUG_NOTIFY_SESSION_ACCESSIBLE => {
+            if let Err(error) = PluginServerControl::start(None) {
+                let _ = notify_windbg(&format!(
+                    "WinDbg MCP server auto-start failed on accessible session: {error}\n"
+                ));
+                return;
+            }
+            if let Err(error) = ensure_target_event_callbacks() {
+                let _ = notify_windbg(&format!(
+                    "WinDbg MCP event callback registration failed on accessible session: {error}\n"
+                ));
+            }
+            if let Err(error) = PluginServerControl::apply_session_event(SessionEvent::Accessible) {
+                let _ = notify_windbg(&format!(
+                    "WinDbg MCP accessible session transition failed: {error}\n"
+                ));
+            }
+        }
+        DEBUG_NOTIFY_SESSION_INACCESSIBLE => {
+            if let Err(error) = PluginServerControl::apply_session_event(SessionEvent::Inaccessible)
+            {
+                let _ = notify_windbg(&format!(
+                    "WinDbg MCP inaccessible session transition failed: {error}\n"
+                ));
+            }
+        }
         DEBUG_NOTIFY_SESSION_INACTIVE => {
-            let _ = notify_windbg("WinDbg MCP server is stopping...\n");
-            let _ = PluginServerControl::stop();
+            if let Err(error) = PluginServerControl::apply_session_event(SessionEvent::Inactive) {
+                let _ = notify_windbg(&format!(
+                    "WinDbg MCP inactive session transition failed: {error}\n"
+                ));
+            }
         }
         _ => {}
     }
@@ -137,16 +183,12 @@ fn run_mcp_command(client: Ref<IDebugClient>, args: PCSTR) -> WinResult<()> {
 }
 
 fn help_text() -> &'static str {
-    "windbg-mcp commands:\n\n  !mcp help\n      Show this help text.\n\n  !mcp serve [host:port]\n      Start the MCP Streamable HTTP server inside the WinDbg plugin. Default bind: 127.0.0.1:50051, endpoint: /mcp\n\n  !mcp status\n      Show whether the in-process MCP server is running.\n\n  !mcp stop\n      Stop the in-process MCP server.\n\n  !mcp catalog [query]\n      List catalog entries or search the extracted debugger command catalog.\n\n  !mcp doc <token-or-id>\n      Show the static documentation for one extracted command topic."
+    "windbg-mcp commands:\n\n  !mcp help\n      Show this help text.\n\n  !mcp serve [host:port]\n      Start the MCP Streamable HTTP server inside the WinDbg plugin. Default bind tries 127.0.0.1:50051 through 127.0.0.1:50070, endpoint: /mcp\n\n  !mcp status\n      Show whether the in-process MCP server is running.\n\n  !mcp stop\n      Stop the in-process MCP server.\n\n  !mcp catalog [query]\n      List catalog entries or search the extracted debugger command catalog.\n\n  !mcp doc <token-or-id>\n      Show the static documentation for one extracted command topic."
 }
 
 fn command_serve(control: &IDebugControl, bind: &str) -> WinResult<()> {
     match PluginServerControl::start((!bind.is_empty()).then_some(bind)) {
-        Ok(status) => write_text(
-            control,
-            &format!("WinDbg MCP server is running at {}\n", status.mcp_url),
-            DEBUG_OUTPUT_NORMAL,
-        ),
+        Ok(status) => write_text(control, &format_status(&status), DEBUG_OUTPUT_NORMAL),
         Err(error) => write_text(
             control,
             &format!("Failed to start WinDbg MCP server: {error}\n"),
@@ -157,11 +199,7 @@ fn command_serve(control: &IDebugControl, bind: &str) -> WinResult<()> {
 
 fn command_status(control: &IDebugControl) -> WinResult<()> {
     match PluginServerControl::status() {
-        Ok(Some(status)) => write_text(
-            control,
-            &format!("WinDbg MCP server is running at {}\n", status.mcp_url),
-            DEBUG_OUTPUT_NORMAL,
-        ),
+        Ok(Some(status)) => write_text(control, &format_status(&status), DEBUG_OUTPUT_NORMAL),
         Ok(None) => write_text(
             control,
             "WinDbg MCP server is not running.\n",
@@ -169,6 +207,14 @@ fn command_status(control: &IDebugControl) -> WinResult<()> {
         ),
         Err(error) => Err(windows::core::Error::new(E_FAIL, error)),
     }
+}
+
+fn format_status(status: &PluginServerStatus) -> String {
+    let mut text = format!("WinDbg MCP server is running at {}\n", status.mcp_url);
+    if let Some(path) = &status.registry_path {
+        text.push_str(&format!("Instance registry: {}\n", path.display()));
+    }
+    text
 }
 
 fn command_stop(control: &IDebugControl) -> WinResult<()> {

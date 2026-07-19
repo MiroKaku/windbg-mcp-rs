@@ -14,6 +14,8 @@ jobs:
     strategy:
       matrix:
         include:
+          - target: i686-pc-windows-msvc
+            arch: x86
           - target: x86_64-pc-windows-msvc
             arch: x64
           - target: aarch64-pc-windows-msvc
@@ -85,6 +87,8 @@ jobs:
           artifactErrorsFailBuild: true
           generateReleaseNotes: true
           artifacts: |
+            release-x86/*.zip
+            release-x86/*.sha256
             release-x64/*.zip
             release-x64/*.sha256
             release-arm64/*.zip

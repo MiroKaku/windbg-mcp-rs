@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 #[cfg(windows)]
-use crate::plugin_server::PluginServerControl;
+use crate::plugin_server::{McpExecutionGuard, PluginServerControl};
 use crate::{
     catalog::{Catalog, CatalogEntry, CatalogResourceKind, CatalogSection},
     executor::CommandDispatcher,
@@ -74,6 +74,16 @@ impl WindbgMcpServer {
         }
     }
 
+    #[cfg(windows)]
+    fn execution_guard(&self) -> Result<Option<McpExecutionGuard<'static>>, McpError> {
+        if self.dispatcher_override.is_some() {
+            return Ok(None);
+        }
+        PluginServerControl::begin_execution()
+            .map(Some)
+            .map_err(|error| McpError::internal_error(error, None))
+    }
+
     fn parse_arguments<T>(&self, arguments: Option<JsonObject>) -> Result<T, McpError>
     where
         T: for<'de> Deserialize<'de>,
@@ -136,6 +146,33 @@ impl WindbgMcpServer {
             let truncated: String = preview.chars().take(157).collect();
             Some(format!("{truncated}..."))
         }
+    }
+
+    async fn run_raw_command_tool(&self, command: String) -> Result<CallToolResult, McpError> {
+        if contains_mcp_extension_command(&command) {
+            return Err(McpError::invalid_params(
+                "`windbg_execute_command` cannot invoke `!mcp` extension commands from inside the MCP server. Use the MCP tools directly instead."
+                    .to_string(),
+                None,
+            ));
+        }
+        #[cfg(windows)]
+        let _execution_guard = self.execution_guard()?;
+        let dispatcher = self.dispatcher()?;
+        let execution = dispatcher
+            .execute(command)
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        #[cfg(windows)]
+        if command_may_change_current_context(&execution.command) {
+            let _ = PluginServerControl::request_target_snapshot_refresh();
+        }
+        Ok(CallToolResult::structured(json!({
+            "command": execution.command,
+            "output": execution.output,
+            "state_before": execution.state_before,
+            "state_after": execution.state_after,
+        })))
     }
 
     #[cfg(test)]
@@ -221,20 +258,12 @@ impl ServerHandler for WindbgMcpServer {
         match request.name.as_ref() {
             "windbg_execute_command" => {
                 let args: ExecuteRawArgs = self.parse_arguments(request.arguments)?;
-                let dispatcher = self.dispatcher()?;
-                let execution = dispatcher
-                    .execute(args.command.clone())
-                    .await
-                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-                Ok(CallToolResult::structured(json!({
-                    "command": execution.command,
-                    "output": execution.output,
-                    "state_before": execution.state_before,
-                    "state_after": execution.state_after,
-                })))
+                self.run_raw_command_tool(args.command).await
             }
             "windbg_get_execution_state" => {
                 let _: GetExecutionStateArgs = self.parse_arguments(request.arguments)?;
+                #[cfg(windows)]
+                let _execution_guard = self.execution_guard()?;
                 let dispatcher = self.dispatcher()?;
                 let state = dispatcher
                     .query_state()
@@ -282,6 +311,8 @@ impl ServerHandler for WindbgMcpServer {
             }
             "windbg_interrupt_target" => {
                 let _: InterruptTargetArgs = self.parse_arguments(request.arguments)?;
+                #[cfg(windows)]
+                let _execution_guard = self.execution_guard()?;
                 let dispatcher = self.dispatcher()?;
                 let state = dispatcher
                     .interrupt()
@@ -378,6 +409,58 @@ impl ServerHandler for WindbgMcpServer {
             request.uri,
         )]))
     }
+}
+
+fn contains_mcp_extension_command(command: &str) -> bool {
+    command.split([';', '\r', '\n']).any(|segment| {
+        let Some(name) = segment
+            .trim_start()
+            .strip_prefix('!')
+            .and_then(|rest| rest.split_whitespace().next())
+        else {
+            return false;
+        };
+        if name.eq_ignore_ascii_case("mcp") {
+            return true;
+        }
+        name.rsplit_once('.').is_some_and(|(module, export)| {
+            !module.is_empty() && export.eq_ignore_ascii_case("mcp")
+        })
+    })
+}
+
+fn command_may_change_current_context(command: &str) -> bool {
+    command.split(';').any(|segment| {
+        let trimmed = segment.trim_start();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        let lower = trimmed.to_ascii_lowercase();
+        let first_token = lower.split_whitespace().next().unwrap_or_default();
+        if matches!(
+            first_token,
+            ".process" | ".thread" | ".cxr" | ".trap" | ".context"
+        ) {
+            return true;
+        }
+
+        selector_command_requests_switch(&lower, "||")
+            || selector_command_requests_switch(&lower, "|")
+            || selector_command_requests_switch(&lower, "~")
+    })
+}
+
+fn selector_command_requests_switch(command: &str, prefix: &str) -> bool {
+    let Some(rest) = command.strip_prefix(prefix) else {
+        return false;
+    };
+    let compact: String = rest
+        .chars()
+        .take_while(|ch| *ch != ';')
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    !compact.is_empty() && compact.contains('s')
 }
 
 #[cfg(test)]
@@ -488,5 +571,72 @@ mod tests {
 
         let preview = server.syntax_preview(entry).expect("preview should exist");
         assert!(preview.contains("User-Mode"));
+    }
+
+    #[test]
+    fn rejects_only_segment_initial_mcp_extension_commands() {
+        for command in [
+            "!mcp status",
+            "r; !MCP stop",
+            "r\r\n!mcp",
+            "!windbg_mcp_rs.mcp stop",
+            "!windbg_mcp_rs_x64.mcp stop",
+        ] {
+            assert!(
+                contains_mcp_extension_command(command),
+                "{command} should be rejected"
+            );
+        }
+        for command in [
+            "!mcp2",
+            "!windbg.mcp2",
+            "r !mcp",
+            "r; k",
+            "ordinary command",
+        ] {
+            assert!(
+                !contains_mcp_extension_command(command),
+                "{command} should be allowed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_command_handler_rejects_mcp_before_dispatch() {
+        let command = "!windbg_mcp_rs_x64.mcp stop";
+        let dispatcher = CommandDispatcher::spawn(ExecutionMode::Mock {
+            responses: HashMap::from([(command.to_string(), "unexpected".to_string())]),
+        })
+        .expect("dispatcher should start");
+        let server = WindbgMcpServer::with_dispatcher(dispatcher);
+
+        let error = server
+            .run_raw_command_tool(command.to_string())
+            .await
+            .expect_err("recursive command must be rejected");
+
+        assert_eq!(
+            error,
+            McpError::invalid_params(
+                "`windbg_execute_command` cannot invoke `!mcp` extension commands from inside the MCP server. Use the MCP tools directly instead."
+                    .to_string(),
+                None,
+            )
+        );
+    }
+
+    #[test]
+    fn detects_explicit_context_switch_commands() {
+        assert!(command_may_change_current_context("|1s"));
+        assert!(command_may_change_current_context("|| 0 s"));
+        assert!(command_may_change_current_context("~3s"));
+        assert!(command_may_change_current_context(
+            ".process /r /p ffff8000`12340000"
+        ));
+        assert!(command_may_change_current_context(
+            ".thread ffff8000`12340000"
+        ));
+        assert!(!command_may_change_current_context("r"));
+        assert!(!command_may_change_current_context("dd esp L10"));
     }
 }

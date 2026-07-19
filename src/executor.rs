@@ -1,4 +1,9 @@
-use std::{collections::HashMap, ffi::CString, sync::mpsc, thread};
+use std::{
+    collections::HashMap,
+    ffi::CString,
+    sync::{Arc, Mutex, mpsc},
+    thread,
+};
 
 use serde::Serialize;
 use tokio::sync::oneshot;
@@ -209,9 +214,31 @@ enum DispatcherRequest {
     },
 }
 
+struct CommandDispatcherInner {
+    sender: Mutex<Option<tokio::sync::mpsc::UnboundedSender<DispatcherRequest>>>,
+    join_handle: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl Drop for CommandDispatcherInner {
+    fn drop(&mut self) {
+        self.sender
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(join_handle) = self
+            .join_handle
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = join_handle.join();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CommandDispatcher {
-    sender: tokio::sync::mpsc::UnboundedSender<DispatcherRequest>,
+    inner: Arc<CommandDispatcherInner>,
 }
 
 impl CommandDispatcher {
@@ -219,7 +246,7 @@ impl CommandDispatcher {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<DispatcherRequest>();
         let (ready_tx, ready_rx) = mpsc::channel();
 
-        thread::Builder::new()
+        let join_handle = thread::Builder::new()
             .name("windbg-mcp-dispatcher".to_string())
             .spawn(move || {
                 let mut executor = match build_executor(mode) {
@@ -252,11 +279,57 @@ impl CommandDispatcher {
             })
             .map_err(|error| ExecutionError::Startup(error.to_string()))?;
 
-        ready_rx
-            .recv()
-            .map_err(|_| ExecutionError::WorkerStopped)??;
+        match ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let _ = join_handle.join();
+                return Err(error);
+            }
+            Err(_) => {
+                let _ = join_handle.join();
+                return Err(ExecutionError::WorkerStopped);
+            }
+        }
 
-        Ok(Self { sender })
+        Ok(Self {
+            inner: Arc::new(CommandDispatcherInner {
+                sender: Mutex::new(Some(sender)),
+                join_handle: Mutex::new(Some(join_handle)),
+            }),
+        })
+    }
+
+    pub fn shutdown(&self) -> Result<(), ExecutionError> {
+        self.inner
+            .sender
+            .lock()
+            .map_err(|_| ExecutionError::WorkerStopped)?
+            .take();
+        let join_handle = self
+            .inner
+            .join_handle
+            .lock()
+            .map_err(|_| ExecutionError::WorkerStopped)?
+            .take();
+        let Some(join_handle) = join_handle else {
+            return Ok(());
+        };
+        join_handle
+            .join()
+            .map_err(|_| ExecutionError::WorkerStopped)
+    }
+
+    fn send(&self, request: DispatcherRequest) -> Result<(), ExecutionError> {
+        let sender = self
+            .inner
+            .sender
+            .lock()
+            .map_err(|_| ExecutionError::WorkerStopped)?;
+        sender
+            .as_ref()
+            .ok_or(ExecutionError::WorkerStopped)?
+            .send(request)
+            .map_err(|_| ExecutionError::WorkerStopped)
     }
 
     pub async fn execute(
@@ -264,12 +337,10 @@ impl CommandDispatcher {
         command: impl Into<String>,
     ) -> Result<CommandExecutionResult, ExecutionError> {
         let (response_tx, response_rx) = oneshot::channel();
-        self.sender
-            .send(DispatcherRequest::Execute {
-                command: command.into(),
-                response: response_tx,
-            })
-            .map_err(|_| ExecutionError::WorkerStopped)?;
+        self.send(DispatcherRequest::Execute {
+            command: command.into(),
+            response: response_tx,
+        })?;
 
         response_rx
             .await
@@ -278,11 +349,9 @@ impl CommandDispatcher {
 
     pub async fn query_state(&self) -> Result<DebuggerExecutionState, ExecutionError> {
         let (response_tx, response_rx) = oneshot::channel();
-        self.sender
-            .send(DispatcherRequest::QueryState {
-                response: response_tx,
-            })
-            .map_err(|_| ExecutionError::WorkerStopped)?;
+        self.send(DispatcherRequest::QueryState {
+            response: response_tx,
+        })?;
 
         response_rx
             .await
@@ -291,11 +360,9 @@ impl CommandDispatcher {
 
     pub async fn interrupt(&self) -> Result<DebuggerExecutionState, ExecutionError> {
         let (response_tx, response_rx) = oneshot::channel();
-        self.sender
-            .send(DispatcherRequest::Interrupt {
-                response: response_tx,
-            })
-            .map_err(|_| ExecutionError::WorkerStopped)?;
+        self.send(DispatcherRequest::Interrupt {
+            response: response_tx,
+        })?;
 
         response_rx
             .await
@@ -570,5 +637,38 @@ mod tests {
                 .to_string()
                 .contains("debugger is not ready for commands")
         );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_shutdown_joins_and_stops_all_existing_clones() {
+        let dispatcher = CommandDispatcher::spawn(ExecutionMode::Mock {
+            responses: HashMap::from([("r".to_string(), "rax=1".to_string())]),
+        })
+        .expect("dispatcher should start");
+        let old_clone = dispatcher.clone();
+
+        let result = old_clone
+            .execute("r")
+            .await
+            .expect("request before shutdown should complete");
+        assert_eq!(result.output, "rax=1");
+
+        dispatcher.shutdown().expect("shutdown should join worker");
+        dispatcher
+            .shutdown()
+            .expect("duplicate shutdown should be idempotent");
+
+        assert!(matches!(
+            old_clone.execute("r").await,
+            Err(ExecutionError::WorkerStopped)
+        ));
+        assert!(matches!(
+            old_clone.query_state().await,
+            Err(ExecutionError::WorkerStopped)
+        ));
+        assert!(matches!(
+            old_clone.interrupt().await,
+            Err(ExecutionError::WorkerStopped)
+        ));
     }
 }
