@@ -91,7 +91,7 @@ try {
         Assert-Equal $ArchitectureTable.Count 3 "architecture table count"
         Assert-Equal @($ArchitectureTable.Name | Select-Object -Unique).Count 3 "architecture names are unique"
         Assert-Equal @($ArchitectureTable.RustTarget | Select-Object -Unique).Count 3 "Rust targets are unique"
-        Assert-Equal @($ArchitectureTable.StoreDllName | Select-Object -Unique).Count 3 "Store DLL names are unique"
+        Assert-Equal @($ArchitectureTable.StoreDllName | Select-Object -Unique).Count 1 "Store DLL names match BinaryComponent name"
         Assert-Equal (Get-ArchitectureByName -Name "x86").PeMachine ([uint16]0x014C) "x86 PE machine"
         Assert-Equal (Get-ArchitectureByName -Name "x64").PeMachine ([uint16]0x8664) "x64 PE machine"
         Assert-Equal (Get-ArchitectureByName -Name "arm64").PeMachine ([uint16]0xAA64) "ARM64 PE machine"
@@ -146,8 +146,8 @@ try {
         }
 
         $appxRoots = @(Get-StorePackageRoots -AppxPackages @(
-            [pscustomobject]@{ InstallLocation = $oldAppx; Version = [version]"1.9.0.0" },
-            [pscustomobject]@{ InstallLocation = $newAppx; Version = [version]"1.10.0.0" }
+            [pscustomobject]@{ InstallLocation = $oldAppx; Version = [version]"1.9.0.0"; Architecture = "x64" },
+            [pscustomobject]@{ InstallLocation = $newAppx; Version = [version]"1.10.0.0"; Architecture = "x64" }
         ) -WindowsAppsRoot $windowsApps)
         Assert-Equal $appxRoots.Count 2 "both usable Appx roots returned"
         Assert-Equal $appxRoots[0].Path (Resolve-Path $newAppx).Path "newest Appx package sorts first"
@@ -172,29 +172,43 @@ try {
             New-EngineFixture -Root $storePackage -Subdirectory $architecture.StorePackageDirectory
         }
         $storeBase = Join-Path $testRoot "mapped-store-base"
-        $installations = @(Find-WinDbgInstallations -SdkRoots @($sdkRoot) -StorePackageRoots @([pscustomobject]@{ Path = $storePackage }) -StoreBasePath $storeBase)
-        Assert-Equal $installations.Count 6 "SDK and Store installation count"
-        Assert-Equal @($installations | Where-Object Type -eq "SDK").Count 3 "SDK architecture count"
-        Assert-Equal @($installations | Where-Object Type -eq "Store").Count 3 "Store architecture count"
-        Assert-Equal @($installations.Architecture.Name | Select-Object -Unique).Count 3 "mapped architecture count"
+        $installations = @(Find-WinDbgInstallations -SdkRoots @($sdkRoot) -StorePackageRoots @([pscustomobject]@{ Path = $storePackage; Architecture = "x64" }) -StoreBasePath $storeBase -HostArchitecture "x64")
+        Assert-Equal $installations.Count 4 "SDK and Store installation count"
+        Assert-Equal @($installations | Where-Object Type -eq "SDK").Count 2 "x64 host SDK architecture count"
+        Assert-Equal @($installations | Where-Object Type -eq "Store").Count 2 "x64 Store architecture count"
+        Assert-Equal (@($installations.Architecture.Name | Select-Object -Unique | Sort-Object) -join ",") "x64,x86" "mapped architecture set"
+
+        $armSdkBase = Join-Path $testRoot "mapped-sdk-arm-base"
+        $armSdkInstallations = @(Find-WinDbgInstallations -SdkRoots @($sdkRoot) -StorePackageRoots @() -StoreBasePath $armSdkBase -HostArchitecture "arm64")
+        Assert-Equal $armSdkInstallations.Count 1 "ARM64 host SDK installs only native architecture"
+        Assert-Equal $armSdkInstallations[0].Architecture.Name "arm64" "ARM64 SDK architecture"
+
+        $armStoreBase = Join-Path $testRoot "mapped-store-arm-base"
+        $armInstallations = @(Find-WinDbgInstallations -SdkRoots @() -StorePackageRoots @([pscustomobject]@{ Path = $storePackage; Architecture = "arm64" }) -StoreBasePath $armStoreBase -HostArchitecture "arm64")
+        Assert-Equal $armInstallations.Count 1 "ARM64 Store installs only native architecture"
+        Assert-Equal $armInstallations[0].Architecture.Name "arm64" "ARM64 Store architecture"
     }
 
     Invoke-NamedTest "unique Store DLL destinations and manifest entries" {
         $storeBase = Join-Path $testRoot "store-paths"
-        $paths = @($ArchitectureTable | ForEach-Object { Get-StoreDllPath -BasePath $storeBase -Architecture $_ })
-        Assert-Equal @($paths | Select-Object -Unique).Count 3 "Store destination paths are unique"
-        Assert-True ($paths -contains (Join-Path $storeBase "EngineExtensions32\windbg_mcp_rs_x86.dll")) "x86 Store path"
-        Assert-True ($paths -contains (Join-Path $storeBase "EngineExtensions\windbg_mcp_rs_x64.dll")) "x64 Store path"
-        Assert-True ($paths -contains (Join-Path $storeBase "EngineExtensions\windbg_mcp_rs_arm64.dll")) "ARM64 Store path"
+        $x64StoreArchitectures = @(Get-StoreArchitecturesForPackage -PackageArchitecture "x64")
+        $paths = @($x64StoreArchitectures | ForEach-Object { Get-StoreDllPath -BasePath $storeBase -Architecture $_ })
+        Assert-Equal @($paths | Select-Object -Unique).Count 2 "x64 Store destination paths are unique"
+        Assert-True ($paths -contains (Join-Path $storeBase "EngineExtensions32\windbg_mcp_rs.dll")) "x86 Store path"
+        Assert-True ($paths -contains (Join-Path $storeBase "EngineExtensions\windbg_mcp_rs.dll")) "x64 Store path"
 
-        $entries = @($ArchitectureTable | ForEach-Object {
+        $armStoreArchitectures = @(Get-StoreArchitecturesForPackage -PackageArchitecture "arm64")
+        Assert-Equal $armStoreArchitectures.Count 1 "ARM64 Store destination count"
+        Assert-Equal (Get-StoreDllPath -BasePath $storeBase -Architecture $armStoreArchitectures[0]) (Join-Path $storeBase "EngineExtensions\windbg_mcp_rs.dll") "ARM64 Store path"
+
+        $entries = @($x64StoreArchitectures | ForEach-Object {
             [pscustomobject]@{ Architecture = $_; ModulePath = Get-StoreDllPath -BasePath $storeBase -Architecture $_ }
         })
         $manifestText = New-StoreGalleryManifest -TemplatePath $templatePath -StoreEntries $entries
         [xml]$manifestXml = $manifestText
         $files = @($manifestXml.SelectNodes("//BinaryComponent/Files/File"))
-        Assert-Equal $files.Count 3 "generated manifest File count"
-        Assert-Equal (@($files.Architecture | Sort-Object) -join ",") "amd64,arm64,x86" "generated manifest architecture set"
+        Assert-Equal $files.Count 2 "generated manifest File count"
+        Assert-Equal (@($files.Architecture | Sort-Object) -join ",") "amd64,x86" "generated manifest architecture set"
         foreach ($file in $files) {
             Assert-Equal $file.FilePathKind "Absolute" "Store manifest path kind"
             Assert-True ([IO.Path]::IsPathRooted($file.Module)) "Store manifest module is absolute"
@@ -209,7 +223,8 @@ try {
 
     Invoke-NamedTest "Store transaction, failure preservation, and DryRun" {
         $sourceRoot = Join-Path $testRoot "store-sources"
-        $pending = @($ArchitectureTable | ForEach-Object {
+        $storeArchitectures = @(Get-StoreArchitecturesForPackage -PackageArchitecture "x64")
+        $pending = @($storeArchitectures | ForEach-Object {
             $source = Join-Path $sourceRoot "$($_.Name).dll"
             New-TestPe -Path $source -Machine $_.PeMachine
             [pscustomobject]@{ Architecture = $_; SourceDll = $source }
@@ -217,13 +232,13 @@ try {
 
         $dryRunBase = Join-Path $testRoot "dry-run-store"
         $dryRunResult = Invoke-StoreManifestTransaction -BasePath $dryRunBase -PendingEntries $pending -TemplatePath $templatePath -DryRun
-        Assert-Equal $dryRunResult.Validated 3 "DryRun validated Store architecture count"
+        Assert-Equal $dryRunResult.Validated 2 "DryRun validated Store architecture count"
         Assert-Equal $dryRunResult.Installed 0 "DryRun installed count"
         Assert-True (-not (Test-Path -LiteralPath $dryRunBase)) "DryRun creates no Store directories"
 
         $storeBase = Join-Path $testRoot "transaction-store"
         $success = Invoke-StoreManifestTransaction -BasePath $storeBase -PendingEntries $pending -TemplatePath $templatePath
-        Assert-Equal $success.Installed 3 "successful Store transaction install count"
+        Assert-Equal $success.Installed 2 "successful Store transaction install count"
         Assert-Equal $success.Failed 0 "successful Store transaction failure count"
         Assert-True $success.Published "successful Store manifest publication"
         $manifestPath = Join-Path $storeBase "ExtRepository\windbg-mcp-rs\manifest.1.xml"
@@ -232,7 +247,7 @@ try {
         [xml]$null = [IO.File]::ReadAllText($manifestPath)
         [xml]$null = [IO.File]::ReadAllText($configPath)
         Assert-True (Test-Path -LiteralPath $versionPath -PathType Leaf) "ManifestVersion is published"
-        foreach ($architecture in $ArchitectureTable) {
+        foreach ($architecture in $storeArchitectures) {
             $installedDll = Get-StoreDllPath -BasePath $storeBase -Architecture $architecture
             Assert-Equal (Get-PeMachine -Path $installedDll) $architecture.PeMachine "$($architecture.Name) installed Store PE"
         }
@@ -241,19 +256,19 @@ try {
         [IO.File]::WriteAllText($manifestPath, $oldPayload)
         $failure = Invoke-StoreManifestTransaction -BasePath $storeBase -PendingEntries $pending -TemplatePath $templatePath -BeforeManifestCommit { param($path) throw "injected manifest commit failure" }
         Assert-Equal $failure.Installed 0 "failed publication installed count"
-        Assert-Equal $failure.Failed 3 "failed publication failure count"
+        Assert-Equal $failure.Failed 2 "failed publication failure count"
         Assert-True (-not $failure.Published) "failed publication result"
         Assert-Equal ([IO.File]::ReadAllText($manifestPath)) $oldPayload "failed publication preserves old manifest"
         Assert-True (-not (Test-Path -LiteralPath "$manifestPath.tmp")) "failed publication removes manifest temp"
 
         $partialBase = Join-Path $testRoot "partial-store"
         $partialPending = @($pending)
-        $partialPending[0] = [pscustomobject]@{ Architecture = $ArchitectureTable[0]; SourceDll = (Join-Path $testRoot "missing-x86.dll") }
+        $partialPending[0] = [pscustomobject]@{ Architecture = $storeArchitectures[0]; SourceDll = (Join-Path $testRoot "missing-x86.dll") }
         $partial = Invoke-StoreManifestTransaction -BasePath $partialBase -PendingEntries $partialPending -TemplatePath $templatePath
-        Assert-Equal $partial.Installed 2 "valid Store entries still publish"
+        Assert-Equal $partial.Installed 1 "valid Store entries still publish"
         Assert-Equal $partial.Failed 1 "missing Store source counted once"
         [xml]$partialManifest = [IO.File]::ReadAllText((Join-Path $partialBase "ExtRepository\windbg-mcp-rs\manifest.1.xml"))
-        Assert-Equal @($partialManifest.SelectNodes("//BinaryComponent/Files/File")).Count 2 "failed copy is excluded from manifest"
+        Assert-Equal @($partialManifest.SelectNodes("//BinaryComponent/Files/File")).Count 1 "failed copy is excluded from manifest"
     }
 
     Invoke-NamedTest "release DryRun uses validated release assets without installation writes" {

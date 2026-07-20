@@ -45,11 +45,11 @@ Release tags publish one architecture-specific archive for every supported WinDb
 
 | WinDbg architecture | Rust target | Release suffix | Store DLL destination |
 | --- | --- | --- | --- |
-| x86 | `i686-pc-windows-msvc` | `windows-x86.zip` | `EngineExtensions32\windbg_mcp_rs_x86.dll` |
-| x64 | `x86_64-pc-windows-msvc` | `windows-x64.zip` | `EngineExtensions\windbg_mcp_rs_x64.dll` |
-| ARM64 | `aarch64-pc-windows-msvc` | `windows-arm64.zip` | `EngineExtensions\windbg_mcp_rs_arm64.dll` |
+| x86 | `i686-pc-windows-msvc` | `windows-x86.zip` | `EngineExtensions32\windbg_mcp_rs.dll` |
+| x64 | `x86_64-pc-windows-msvc` | `windows-x64.zip` | `EngineExtensions\windbg_mcp_rs.dll` |
+| ARM64 | `aarch64-pc-windows-msvc` | `windows-arm64.zip` | `EngineExtensions\windbg_mcp_rs.dll` |
 
-The checked-in gallery manifest remains architecture-neutral (`Architecture="Any"`). The installer generates Store-only absolute entries for the architectures actually installed.
+The checked-in gallery manifest remains architecture-neutral (`Architecture="Any"`). The installer generates Store-only absolute entries for the architectures actually installed. Store gallery package validation requires the loaded DLL file name to match the binary component name, so Store DLLs are always named `windbg_mcp_rs.dll`; architecture is selected by the manifest entry and destination directory. Installation is filtered by host architecture before copying files. On x64 Windows, the installer publishes x86 and x64 entries because WinDbg can use the x86 engine for x86 targets. On ARM64 Windows, the installer publishes only the ARM64 entry by default. Extra SDK directories for non-native architectures are ignored unless they are part of that host architecture set.
 
 ### 3. Install a local build
 
@@ -73,8 +73,8 @@ copy target\<RustTarget>\release\windbg_mcp_rs.dll     <matching-windbg>\winext\
 copy windbg_mcp_rs_GalleryManifest.xml                 <windbg>\OptionalExtensions\
 
 # WinDbg (Store) — use install.ps1 (manual setup is complex)
-# The script uses distinct x86/x64/ARM64 DLL names, rewrites the manifest with
-# absolute architecture-specific paths, and publishes the shared gallery files
+# The script rewrites the manifest with absolute architecture-specific paths
+# and publishes the shared gallery files.
 # atomically under %LOCALAPPDATA%\DBG\ExtRepository\windbg-mcp-rs\.
 # Then run:
 #   .settings load %LOCALAPPDATA%\DBG\ExtRepository\windbg-mcp-rs\config.xml
@@ -108,7 +108,7 @@ When the default port is already in use, auto-start tries the next localhost por
 %LOCALAPPDATA%\Dbg\windbg-mcp-rs\instances\instance-<pid>.json
 ```
 
-The JSON file contains the MCP server name and URL, host WinDbg/EngHost process id, host architecture, host process path, start timestamp, and a best-effort `current_target` snapshot for discovery prioritization. In schema 1, `mcp_server_name` and `mcp_server_url` identify the MCP endpoint, `host_pid`, `host_arch`, and `host_process_path` identify the process hosting the MCP extension, while `current_target` uses `name` for the active target image name/path, `source_path` for offline dump/trace source files when available, and `transport`/`endpoint` for remote transports. `current_target` can be `null` during early startup or after the debug session becomes inactive, and is refreshed after WinDbg reports an accessible session or a relevant target/session event. The snapshot is only a hint; clients must still treat registry files as candidates and confirm liveness and target identity with an MCP `initialize` handshake before using the endpoint. The running extension keeps its own JSON file open with read sharing enabled and delete sharing disabled. When another instance starts, it tries to delete old `instance-*.json` files; active instances remain locked, while stale files from crashed or killed WinDbg processes are normally removed.
+The JSON file contains the MCP server name and URL, host WinDbg/EngHost process id, host architecture, host process path, start timestamp, and a best-effort `current_target` snapshot for discovery prioritization. In schema 1, `mcp_server_name` and `mcp_server_url` identify the MCP endpoint, `host_pid`, `host_arch`, and `host_process_path` identify the process hosting the MCP extension, while `current_target` uses `name` for the active target image name/path, `source_path` for offline dump/trace source files when available, and `transport`/`endpoint` for remote transports. `current_target` can be `null` during early startup or after the debug session becomes inactive, and is refreshed after WinDbg reports an accessible session or a relevant target/session event. The snapshot is only a hint; clients must still treat registry files as candidates and confirm liveness and target identity with an MCP `initialize` handshake before using the endpoint. The running extension keeps a companion `instance-<pid>.lock` file open to mark the instance as active, and rewrites `instance-<pid>.json` through `instance-<pid>.json.tmp` followed by an atomic replace. When another instance starts, it tries to delete old `instance-*.lock`, `instance-*.json`, and `instance-*.json.tmp` groups; active instances remain protected by their lock file, while stale files from crashed or killed WinDbg processes are normally removed.
 
 ## WinDbg Commands
 

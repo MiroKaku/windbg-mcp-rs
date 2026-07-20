@@ -294,7 +294,7 @@ fn write_text(control: &IDebugControl, text: &str, mask: u32) -> WinResult<()> {
         escaped.push('\n');
         let c_text = CString::new(escaped).map_err(|_| windows::core::Error::from(E_POINTER))?;
         unsafe {
-            control.Output(mask, PCSTR(c_text.as_ptr() as _))?;
+            control.OutputVaList(mask, PCSTR(c_text.as_ptr() as _), std::ptr::null())?;
         }
     }
     Ok(())

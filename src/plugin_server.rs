@@ -1175,7 +1175,11 @@ pub(crate) fn notify_windbg(text: &str) -> Result<(), String> {
         let c_text = CString::new(escaped).map_err(|_| "output text contained NUL".to_string())?;
         unsafe {
             control
-                .Output(DEBUG_OUTPUT_NORMAL, PCSTR(c_text.as_ptr() as _))
+                .OutputVaList(
+                    DEBUG_OUTPUT_NORMAL,
+                    PCSTR(c_text.as_ptr() as _),
+                    std::ptr::null(),
+                )
                 .map_err(|error| error.to_string())?;
         }
     }

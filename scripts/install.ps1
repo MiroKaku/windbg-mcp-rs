@@ -36,7 +36,7 @@ $script:ArchitectureTable = @(
         ReleaseAssetSuffix = "x86"
         StorePackageDirectory = "x86"
         StoreExtensionDirectory = "EngineExtensions32"
-        StoreDllName = "windbg_mcp_rs_x86.dll"
+        StoreDllName = "windbg_mcp_rs.dll"
         ManifestArchitecture = "x86"
         PeMachine = [uint16]0x014C
         Order = 1
@@ -47,7 +47,7 @@ $script:ArchitectureTable = @(
         ReleaseAssetSuffix = "x64"
         StorePackageDirectory = "amd64"
         StoreExtensionDirectory = "EngineExtensions"
-        StoreDllName = "windbg_mcp_rs_x64.dll"
+        StoreDllName = "windbg_mcp_rs.dll"
         ManifestArchitecture = "amd64"
         PeMachine = [uint16]0x8664
         Order = 2
@@ -58,7 +58,7 @@ $script:ArchitectureTable = @(
         ReleaseAssetSuffix = "arm64"
         StorePackageDirectory = "arm64"
         StoreExtensionDirectory = "EngineExtensions"
-        StoreDllName = "windbg_mcp_rs_arm64.dll"
+        StoreDllName = "windbg_mcp_rs.dll"
         ManifestArchitecture = "arm64"
         PeMachine = [uint16]0xAA64
         Order = 3
@@ -104,6 +104,85 @@ function Get-ArchitectureByPeMachine {
         throw ("Unsupported PE machine 0x{0:X4}." -f $PeMachine)
     }
     return $match[0]
+}
+
+function Convert-ArchitectureAlias {
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+    switch ($Name.Trim().ToLowerInvariant()) {
+        "x86" { return "x86" }
+        "i386" { return "x86" }
+        "i686" { return "x86" }
+        "x64" { return "x64" }
+        "amd64" { return "x64" }
+        "arm64" { return "arm64" }
+        "aarch64" { return "arm64" }
+        default { return $null }
+    }
+}
+
+function Get-NativeWindowsArchitectureName {
+    $raw = if (-not [string]::IsNullOrWhiteSpace($env:PROCESSOR_ARCHITEW6432)) {
+        $env:PROCESSOR_ARCHITEW6432
+    }
+    else {
+        $env:PROCESSOR_ARCHITECTURE
+    }
+
+    $architecture = Convert-ArchitectureAlias -Name $raw
+    if (-not $architecture) {
+        throw "Unsupported native Windows architecture '$raw'."
+    }
+    return $architecture
+}
+
+function Get-WinDbgArchitecturesForHost {
+    param([string]$HostArchitecture)
+
+    $architecture = Convert-ArchitectureAlias -Name $HostArchitecture
+    if (-not $architecture) {
+        $architecture = Get-NativeWindowsArchitectureName
+    }
+
+    if ($architecture -eq "x64") {
+        return @(
+            Get-ArchitectureByName -Name "x86"
+            Get-ArchitectureByName -Name "x64"
+        )
+    }
+
+    return @(Get-ArchitectureByName -Name $architecture)
+}
+
+function Get-StoreArchitecturesForPackage {
+    param([string]$PackageArchitecture)
+
+    return @(Get-WinDbgArchitecturesForHost -HostArchitecture $PackageArchitecture)
+}
+
+function Get-StorePackageArchitectureName {
+    param(
+        [object]$Package,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    foreach ($propertyName in @("Architecture", "ProcessorArchitecture")) {
+        if ($Package -and ($Package.PSObject.Properties.Name -contains $propertyName)) {
+            $architecture = Convert-ArchitectureAlias -Name ([string]$Package.$propertyName)
+            if ($architecture) { return $architecture }
+        }
+    }
+
+    $leafName = Split-Path -Leaf $Path
+    if ($leafName -match '_(x86|x64|arm64)__') {
+        return (Convert-ArchitectureAlias -Name $Matches[1])
+    }
+    if ($leafName -match '_(x86|x64|arm64)_') {
+        return (Convert-ArchitectureAlias -Name $Matches[1])
+    }
+
+    return Get-NativeWindowsArchitectureName
 }
 
 function Get-PeMachine {
@@ -177,6 +256,7 @@ function Get-StorePackageRoots {
             catch { $versionKey = [version]"0.0" }
             $appxRoots.Add([pscustomobject]@{
                 Path = $normalized
+                Architecture = Get-StorePackageArchitectureName -Package $package -Path $normalized
                 Version = [string]$package.Version
                 VersionKey = $versionKey
             }) | Out-Null
@@ -204,6 +284,7 @@ function Get-StorePackageRoots {
                 catch { $versionKey = [version]"0.0" }
                 $fallbackRoots.Add([pscustomobject]@{
                     Path = $normalized
+                    Architecture = Get-StorePackageArchitectureName -Path $normalized
                     Version = $directory.Name
                     VersionKey = $versionKey
                 }) | Out-Null
@@ -217,7 +298,8 @@ function Find-WinDbgInstallations {
     param(
         [string[]]$SdkRoots,
         [object[]]$StorePackageRoots,
-        [string]$StoreBasePath = (Join-Path $env:LOCALAPPDATA "DBG")
+        [string]$StoreBasePath = (Join-Path $env:LOCALAPPDATA "DBG"),
+        [string]$HostArchitecture
     )
 
     if (-not $PSBoundParameters.ContainsKey("SdkRoots")) {
@@ -246,9 +328,10 @@ function Find-WinDbgInstallations {
 
     $found = [System.Collections.Generic.List[object]]::new()
     $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $sdkArchitectures = @(Get-WinDbgArchitecturesForHost -HostArchitecture $HostArchitecture)
     foreach ($sdkRoot in @($SdkRoots)) {
         if (-not (Test-Path -LiteralPath $sdkRoot -PathType Container)) { continue }
-        foreach ($architecture in $script:ArchitectureTable) {
+        foreach ($architecture in $sdkArchitectures) {
             $engineRoot = Join-Path $sdkRoot $architecture.Name
             if (-not (Test-Path -LiteralPath (Join-Path $engineRoot "dbgeng.dll") -PathType Leaf)) { continue }
             $normalized = (Resolve-Path -LiteralPath $engineRoot).Path
@@ -269,7 +352,16 @@ function Find-WinDbgInstallations {
     foreach ($package in @($StorePackageRoots)) {
         $packagePath = if ($package -is [string]) { $package } else { [string]$package.Path }
         if ([string]::IsNullOrWhiteSpace($packagePath)) { continue }
-        foreach ($architecture in $script:ArchitectureTable) {
+        $packageArchitecture = if ($package -is [string]) {
+            Get-StorePackageArchitectureName -Path $packagePath
+        }
+        elseif ($package.PSObject.Properties.Name -contains "Architecture") {
+            [string]$package.Architecture
+        }
+        else {
+            Get-StorePackageArchitectureName -Path $packagePath
+        }
+        foreach ($architecture in @(Get-StoreArchitecturesForPackage -PackageArchitecture $packageArchitecture)) {
             $engine = Join-Path (Join-Path $packagePath $architecture.StorePackageDirectory) "dbgeng.dll"
             if (-not (Test-Path -LiteralPath $engine -PathType Leaf)) { continue }
             $key = "Store|$storePath|$($architecture.Name)"
