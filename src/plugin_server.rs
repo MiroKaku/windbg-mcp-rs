@@ -1004,7 +1004,6 @@ fn instance_registry_root_directory() -> PathBuf {
     env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir)
-        .join("Dbg")
         .join("windbg-mcp-rs")
 }
 
@@ -1190,6 +1189,17 @@ pub(crate) fn notify_windbg(text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn instance_registry_root_uses_application_directory() {
+        let local_app_data = env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(env::temp_dir);
+
+        assert_eq!(
+            instance_registry_root_directory(),
+            local_app_data.join("windbg-mcp-rs")
+        );
+    }
 
     #[test]
     fn instance_registry_payload_uses_ordered_host_field_names() {

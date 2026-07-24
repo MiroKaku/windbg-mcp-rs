@@ -105,7 +105,7 @@ http://127.0.0.1:50051/mcp
 When the default port is already in use, auto-start tries the next localhost port up to `127.0.0.1:50070`. Each running WinDbg instance writes a user-local discovery file:
 
 ```text
-%LOCALAPPDATA%\Dbg\windbg-mcp-rs\instances\instance-<pid>.json
+%LOCALAPPDATA%\windbg-mcp-rs\instances\instance-<pid>.json
 ```
 
 The JSON file contains the MCP server name and URL, host WinDbg/EngHost process id, host architecture, host process path, start timestamp, and a best-effort `current_target` snapshot for discovery prioritization. In schema 1, `mcp_server_name` and `mcp_server_url` identify the MCP endpoint, `host_pid`, `host_arch`, and `host_process_path` identify the process hosting the MCP extension, while `current_target` uses `name` for the active target image name/path, `source_path` for offline dump/trace source files when available, and `transport`/`endpoint` for remote transports. `current_target` can be `null` during early startup or after the debug session becomes inactive, and is refreshed after WinDbg reports an accessible session or a relevant target/session event. The snapshot is only a hint; clients must still treat registry files as candidates and confirm liveness and target identity with an MCP `initialize` handshake before using the endpoint. The running extension keeps a companion `instance-<pid>.lock` file open to mark the instance as active, and rewrites `instance-<pid>.json` through `instance-<pid>.json.tmp` followed by an atomic replace. When another instance starts, it tries to delete old `instance-*.lock`, `instance-*.json`, and `instance-*.json.tmp` groups; active instances remain protected by their lock file, while stale files from crashed or killed WinDbg processes are normally removed.
