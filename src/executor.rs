@@ -319,6 +319,23 @@ impl CommandDispatcher {
             .map_err(|_| ExecutionError::WorkerStopped)
     }
 
+    /// Returns true when called on the dispatcher worker thread itself.
+    ///
+    /// DbgEng invokes `DebugExtensionUninitialize` synchronously on this thread
+    /// when a command such as `.unload windbg_mcp_rs` runs through `execute`,
+    /// so unload cleanup uses this to detect the reentrancy instead of joining
+    /// the current thread.
+    pub fn is_worker_thread(&self) -> bool {
+        let join_handle = self
+            .inner
+            .join_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        join_handle
+            .as_ref()
+            .is_some_and(|handle| handle.thread().id() == thread::current().id())
+    }
+
     fn send(&self, request: DispatcherRequest) -> Result<(), ExecutionError> {
         let sender = self
             .inner
@@ -670,5 +687,24 @@ mod tests {
             old_clone.interrupt().await,
             Err(ExecutionError::WorkerStopped)
         ));
+    }
+
+    #[tokio::test]
+    async fn dispatcher_is_worker_thread_only_matches_worker() {
+        let dispatcher = CommandDispatcher::spawn(ExecutionMode::Mock {
+            responses: HashMap::new(),
+        })
+        .expect("dispatcher should start");
+
+        assert!(
+            !dispatcher.is_worker_thread(),
+            "caller thread must not be reported as the dispatcher worker"
+        );
+
+        dispatcher.shutdown().expect("shutdown should join worker");
+        assert!(
+            !dispatcher.is_worker_thread(),
+            "joined worker must not be reported as the dispatcher worker"
+        );
     }
 }

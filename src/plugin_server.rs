@@ -496,6 +496,24 @@ impl McpExecutionGate {
         Ok(true)
     }
 
+    /// Rejects new executions without waiting for the active count to drain.
+    ///
+    /// `DebugExtensionUninitialize` can run reentrantly on the dispatcher
+    /// thread when a command such as `.unload windbg_mcp_rs` executes through
+    /// the MCP server. The only active guard then belongs to the request
+    /// blocked inside that very `Execute`, so waiting for `active` to reach
+    /// zero — or joining any owned thread — would deadlock WinDbg.
+    fn begin_reentrant_unload_stop(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.phase == McpExecutionPhase::Running {
+            state.phase = McpExecutionPhase::Stopping;
+            self.wake.notify_all();
+        }
+    }
+
     fn restore_running(&self) {
         let mut state = self
             .state
@@ -699,6 +717,17 @@ impl PluginServerControl {
     }
 
     pub fn stop_for_unload() -> Result<Option<PluginServerStatus>, String> {
+        if Self::called_from_dispatcher_thread() {
+            // Reentrant unload: dbgeng invoked `DebugExtensionUninitialize`
+            // synchronously on the dispatcher thread inside `Execute` (e.g.
+            // `.unload windbg_mcp_rs` issued through `windbg_execute_command`).
+            // The request holding the execution guard is blocked waiting for
+            // this very call, so draining the gate or joining any owned thread
+            // would deadlock. Reject new executions and return; dbgeng unloads
+            // the DLL once the in-flight command completes.
+            EXECUTION_GATE.begin_reentrant_unload_stop();
+            return Ok(None);
+        }
         if !EXECUTION_GATE.begin_unload_stop()? {
             return Ok(None);
         }
@@ -719,6 +748,19 @@ impl PluginServerControl {
         let result = cleanup_running_server(running);
         EXECUTION_GATE.finish_stopped();
         result.map(Some)
+    }
+
+    /// True when unload cleanup is running reentrantly on the dispatcher
+    /// worker thread: dbgeng invokes `DebugExtensionUninitialize` synchronously
+    /// inside `Execute`, so the current thread is the thread that would have to
+    /// be drained and joined during a normal unload stop.
+    fn called_from_dispatcher_thread() -> bool {
+        let state = DISPATCHER_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .as_ref()
+            .is_some_and(CommandDispatcher::is_worker_thread)
     }
 
     pub(crate) fn begin_execution() -> Result<McpExecutionGuard<'static>, String> {
@@ -1631,6 +1673,29 @@ mod tests {
                 .expect("unload should continue")
         );
         unload_thread.join().expect("unload thread should join");
+        assert_eq!(gate.phase(), McpExecutionPhase::Stopped);
+    }
+
+    #[test]
+    fn reentrant_unload_stop_rejects_new_execution_without_waiting() {
+        let gate = McpExecutionGate::new();
+        gate.mark_running().expect("gate should run");
+        let guard = gate.begin_execution().expect("execution should start");
+
+        // Must return immediately even though an execution is active: the
+        // unload path calls this on the dispatcher thread, where waiting for
+        // the guard to drop would deadlock against the in-flight command.
+        gate.begin_reentrant_unload_stop();
+
+        assert_eq!(gate.phase(), McpExecutionPhase::Stopping);
+        let execution_error = match gate.begin_execution() {
+            Ok(_) => panic!("stopping gate must reject execution"),
+            Err(error) => error,
+        };
+        assert_eq!(execution_error, EXECUTION_UNAVAILABLE_ERROR);
+
+        drop(guard);
+        gate.finish_stopped();
         assert_eq!(gate.phase(), McpExecutionPhase::Stopped);
     }
 }

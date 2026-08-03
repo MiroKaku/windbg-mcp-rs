@@ -151,8 +151,7 @@ impl WindbgMcpServer {
     async fn run_raw_command_tool(&self, command: String) -> Result<CallToolResult, McpError> {
         if contains_mcp_extension_command(&command) {
             return Err(McpError::invalid_params(
-                "`windbg_execute_command` cannot invoke `!mcp` extension commands from inside the MCP server. Use the MCP tools directly instead."
-                    .to_string(),
+                RAW_COMMAND_REENTRANCY_ERROR.to_string(),
                 None,
             ));
         }
@@ -411,10 +410,17 @@ impl ServerHandler for WindbgMcpServer {
     }
 }
 
+const EXTENSION_MODULE_STEM: &str = "windbg_mcp_rs";
+
+const RAW_COMMAND_REENTRANCY_ERROR: &str = "`windbg_execute_command` cannot invoke `!mcp` extension commands or unload this extension from inside the MCP server. Use the MCP tools directly instead; run `.unload` from the WinDbg console.";
+
 fn contains_mcp_extension_command(command: &str) -> bool {
     command.split([';', '\r', '\n']).any(|segment| {
+        let segment = segment.trim_start();
+        if segment_unloads_this_extension(segment) {
+            return true;
+        }
         let Some(name) = segment
-            .trim_start()
             .strip_prefix('!')
             .and_then(|rest| rest.split_whitespace().next())
         else {
@@ -426,6 +432,31 @@ fn contains_mcp_extension_command(command: &str) -> bool {
         name.rsplit_once('.').is_some_and(|(module, export)| {
             !module.is_empty() && export.eq_ignore_ascii_case("mcp")
         })
+    })
+}
+
+/// Matches segment-initial `.unload <this extension>` and `.unloadall`.
+/// DbgEng runs `DebugExtensionUninitialize` synchronously inside `Execute` on
+/// the dispatcher thread, so unloading this extension through the raw command
+/// path deadlocks the server; unload from the WinDbg console instead.
+fn segment_unloads_this_extension(segment: &str) -> bool {
+    let mut tokens = segment.split_whitespace();
+    let Some(verb) = tokens.next() else {
+        return false;
+    };
+    if verb.eq_ignore_ascii_case(".unloadall") {
+        return true;
+    }
+    if !verb.eq_ignore_ascii_case(".unload") {
+        return false;
+    }
+    tokens.any(|argument| {
+        let argument = argument.trim_matches(['"', '\'']);
+        let file_name = argument.rsplit(['\\', '/']).next().unwrap_or(argument);
+        let stem = file_name.split('.').next().unwrap_or(file_name);
+        stem.len() >= EXTENSION_MODULE_STEM.len()
+            && stem.as_bytes()[..EXTENSION_MODULE_STEM.len()]
+                .eq_ignore_ascii_case(EXTENSION_MODULE_STEM.as_bytes())
     })
 }
 
@@ -581,6 +612,10 @@ mod tests {
             "r\r\n!mcp",
             "!windbg_mcp_rs.mcp stop",
             "!windbg_mcp_rs_x64.mcp stop",
+            ".unload windbg_mcp_rs_x64",
+            ".unload windbg_mcp_rs.dll",
+            ".unload C:\\windbg\\x64\\winext\\windbg_mcp_rs.dll",
+            "r; .UNLOADALL",
         ] {
             assert!(
                 contains_mcp_extension_command(command),
@@ -593,6 +628,10 @@ mod tests {
             "r !mcp",
             "r; k",
             "ordinary command",
+            ".unload ext2",
+            ".unload",
+            ".unloadallx",
+            ".reload windbg_mcp_rs.dll",
         ] {
             assert!(
                 !contains_mcp_extension_command(command),
@@ -617,11 +656,27 @@ mod tests {
 
         assert_eq!(
             error,
-            McpError::invalid_params(
-                "`windbg_execute_command` cannot invoke `!mcp` extension commands from inside the MCP server. Use the MCP tools directly instead."
-                    .to_string(),
-                None,
-            )
+            McpError::invalid_params(RAW_COMMAND_REENTRANCY_ERROR.to_string(), None)
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_command_handler_rejects_self_unload_before_dispatch() {
+        let command = ".unload windbg_mcp_rs_x64";
+        let dispatcher = CommandDispatcher::spawn(ExecutionMode::Mock {
+            responses: HashMap::from([(command.to_string(), "unexpected".to_string())]),
+        })
+        .expect("dispatcher should start");
+        let server = WindbgMcpServer::with_dispatcher(dispatcher);
+
+        let error = server
+            .run_raw_command_tool(command.to_string())
+            .await
+            .expect_err("self-unload must be rejected");
+
+        assert_eq!(
+            error,
+            McpError::invalid_params(RAW_COMMAND_REENTRANCY_ERROR.to_string(), None)
         );
     }
 
