@@ -430,15 +430,32 @@ fn contains_mcp_extension_command(command: &str) -> bool {
             return true;
         }
         name.rsplit_once('.').is_some_and(|(module, export)| {
-            !module.is_empty() && export.eq_ignore_ascii_case("mcp")
+            !module.is_empty()
+                && (export.eq_ignore_ascii_case("mcp")
+                    || (export.eq_ignore_ascii_case("unload") && names_this_extension(module)))
         })
     })
 }
 
-/// Matches segment-initial `.unload <this extension>` and `.unloadall`.
-/// DbgEng runs `DebugExtensionUninitialize` synchronously inside `Execute` on
-/// the dispatcher thread, so unloading this extension through the raw command
-/// path deadlocks the server; unload from the WinDbg console instead.
+/// True when a module token names this extension DLL (`windbg_mcp_rs`,
+/// `windbg_mcp_rs_x64`, ...), tolerating quotes, directory prefixes, and a
+/// trailing `.dll`.
+fn names_this_extension(token: &str) -> bool {
+    let token = token.trim_matches(['"', '\'']);
+    let file_name = token.rsplit(['\\', '/']).next().unwrap_or(token);
+    let stem = file_name.split('.').next().unwrap_or(file_name);
+    stem.len() >= EXTENSION_MODULE_STEM.len()
+        && stem.as_bytes()[..EXTENSION_MODULE_STEM.len()]
+            .eq_ignore_ascii_case(EXTENSION_MODULE_STEM.as_bytes())
+}
+
+/// Matches segment-initial `.unload` forms that can unload this extension:
+/// `.unloadall`, `.unload <this extension>` (also as `!module.unload`), and a
+/// bare `.unload`, which unloads the *current* extension DLL — potentially
+/// this one. DbgEng runs `DebugExtensionUninitialize` synchronously inside
+/// `Execute` on the dispatcher thread, so unloading this extension through
+/// the raw command path deadlocks the server; unload from the WinDbg console
+/// instead.
 fn segment_unloads_this_extension(segment: &str) -> bool {
     let mut tokens = segment.split_whitespace();
     let Some(verb) = tokens.next() else {
@@ -450,14 +467,11 @@ fn segment_unloads_this_extension(segment: &str) -> bool {
     if !verb.eq_ignore_ascii_case(".unload") {
         return false;
     }
-    tokens.any(|argument| {
-        let argument = argument.trim_matches(['"', '\'']);
-        let file_name = argument.rsplit(['\\', '/']).next().unwrap_or(argument);
-        let stem = file_name.split('.').next().unwrap_or(file_name);
-        stem.len() >= EXTENSION_MODULE_STEM.len()
-            && stem.as_bytes()[..EXTENSION_MODULE_STEM.len()]
-                .eq_ignore_ascii_case(EXTENSION_MODULE_STEM.as_bytes())
-    })
+    let arguments: Vec<&str> = tokens.collect();
+    if arguments.is_empty() {
+        return true;
+    }
+    arguments.into_iter().any(names_this_extension)
 }
 
 fn command_may_change_current_context(command: &str) -> bool {
@@ -616,6 +630,9 @@ mod tests {
             ".unload windbg_mcp_rs.dll",
             ".unload C:\\windbg\\x64\\winext\\windbg_mcp_rs.dll",
             "r; .UNLOADALL",
+            ".unload",
+            "!windbg_mcp_rs.unload",
+            "!windbg_mcp_rs_x64.unload",
         ] {
             assert!(
                 contains_mcp_extension_command(command),
@@ -629,9 +646,9 @@ mod tests {
             "r; k",
             "ordinary command",
             ".unload ext2",
-            ".unload",
             ".unloadallx",
             ".reload windbg_mcp_rs.dll",
+            "!otherext.unload",
         ] {
             assert!(
                 !contains_mcp_extension_command(command),
