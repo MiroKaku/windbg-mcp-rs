@@ -726,13 +726,17 @@ function Invoke-WindbgMcpInstall {
     foreach ($installation in $installations) { Write-Host "  $($installation.Label)" -ForegroundColor Gray }
 
     $requiredArchitectures = @($installations | ForEach-Object { $_.Architecture } | Group-Object Name | ForEach-Object { $_.Group[0] } | Sort-Object Order)
-    $manifestTemplate = Join-Path $script:ScriptDir "..\windbg_mcp_rs_GalleryManifest.xml"
-    if (-not (Test-Path -LiteralPath $manifestTemplate -PathType Leaf)) {
-        throw "Gallery manifest template not found at '$manifestTemplate'."
-    }
 
     $dllByArchitecture = @{}
     if ($LocalPath) {
+        # The repo-local manifest template is only needed for local builds; the
+        # release path extracts the manifest from each downloaded architecture
+        # archive. Resolving it unconditionally breaks the irm | iex one-liner,
+        # where $script:ScriptDir is empty and there is no repo checkout.
+        $manifestTemplate = Join-Path $script:ScriptDir "..\windbg_mcp_rs_GalleryManifest.xml"
+        if (-not (Test-Path -LiteralPath $manifestTemplate -PathType Leaf)) {
+            throw "Gallery manifest template not found at '$manifestTemplate'."
+        }
         Write-Host "=== windbg-mcp-rs Installer (local) ===" -ForegroundColor Cyan
         $localDlls = Resolve-LocalDlls -LocalPath $LocalPath
         foreach ($name in $localDlls.Keys) {
